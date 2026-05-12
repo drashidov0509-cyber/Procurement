@@ -1,0 +1,60 @@
+name: Build Windows EXE
+
+# Запускается:
+# - автоматически когда вы заливаете код в репозиторий
+# - вручную через кнопку "Run workflow" в GitHub
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Procurement.exe
+    runs-on: windows-latest   # GitHub даёт нам бесплатную Windows-машину
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pywebview httpx selectolax openpyxl pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed `
+            --name Procurement `
+            --add-data "ui.html;." `
+            --hidden-import _cffi_backend `
+            --collect-all webview `
+            --noconfirm `
+            app.py
+
+      - name: Show build result
+        run: |
+          dir dist
+          $size = (Get-Item dist/Procurement.exe).Length / 1MB
+          Write-Host "Размер: $($size.ToString('0.0')) MB"
+
+      - name: Upload Procurement.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: Procurement-Windows
+          path: dist/Procurement.exe
+          retention-days: 90
+
+      - name: Create Release (when tag pushed)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Procurement.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
