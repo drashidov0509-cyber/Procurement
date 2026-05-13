@@ -1,10 +1,11 @@
 """
-Скраперы маркетплейсов для разных стран.
-Полноценная поддержка: UZ, AZ, KZ, KG, RU, TR
-Для остальных — фолбэк через DuckDuckGo.
+Поиск поставщиков через специализированные B2B-сайты и веб-поиск.
+Основной принцип: ищем конкретный товар на специализированных площадках,
+а не на OLX где продают всё подряд.
 """
 import asyncio
 import httpx
+import re
 from urllib.parse import quote_plus, urlparse
 from typing import List, Optional
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,uz;q=0.8,en;q=0.7",
 }
 
 TIMEOUT = 15
@@ -38,494 +39,341 @@ class Listing:
 def clean_price(s: str) -> Optional[float]:
     if not s:
         return None
-    cleaned = "".join(c for c in s if c.isdigit() or c in ".,")
-    cleaned = cleaned.replace(",", ".").replace(" ", "")
-    if cleaned.count(".") > 1:
-        parts = cleaned.split(".")
-        cleaned = "".join(parts[:-1]) + "." + parts[-1]
+    cleaned = re.sub(r'[^\d.,]', '', s).replace(',', '.')
+    if cleaned.count('.') > 1:
+        parts = cleaned.split('.')
+        cleaned = ''.join(parts[:-1]) + '.' + parts[-1]
     try:
-        return float(cleaned)
+        v = float(cleaned)
+        return v if v > 0 else None
     except (ValueError, TypeError):
         return None
 
 
 def clean_text(t: Optional[str]) -> str:
-    return " ".join(t.split()) if t else ""
-
-
-def detect_currency(price_text: str, default: str) -> str:
-    if not price_text:
-        return default
-    pt = price_text.upper()
-    if "$" in price_text or "USD" in pt:
-        return "USD"
-    if "€" in price_text or "EUR" in pt:
-        return "EUR"
-    if "₽" in price_text or "РУБ" in pt or "RUB" in pt:
-        return "RUB"
-    if "₸" in price_text or "ТГ" in pt or "KZT" in pt:
-        return "KZT"
-    if "₼" in price_text or "AZN" in pt or "МАН" in pt:
-        return "AZN"
-    if "СОМ" in pt or "KGS" in pt:
-        return "KGS"
-    if "TL" in pt or "₺" in price_text or "TRY" in pt:
-        return "TRY"
-    return default
-
-
-async def fetch_html(url: str, params: dict = None) -> Optional[str]:
-    try:
-        async with httpx.AsyncClient(
-            timeout=TIMEOUT, follow_redirects=True, headers=HEADERS
-        ) as client:
-            r = await client.get(url, params=params)
-            if r.status_code == 200:
-                return r.text
-            print(f"⚠ HTTP {r.status_code}: {url}")
-    except Exception as e:
-        print(f"⚠ Fetch error {url}: {e}")
-    return None
+    return ' '.join(t.split()) if t else ''
 
 
 def extract_domain(url: str) -> str:
     try:
-        return urlparse(url).netloc.replace("www.", "") or "unknown"
+        return urlparse(url).netloc.replace('www.', '')
     except Exception:
-        return "unknown"
+        return 'unknown'
 
 
-# ════════════════════════════════════════════════════════════════════════
-# УЗБЕКИСТАН
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_olx_uz(query: str) -> List[Listing]:
-    """OLX.uz — крупнейшая площадка объявлений Узбекистана"""
-    url = f"https://www.olx.uz/list/q-{quote_plus(query)}/"
-    html = await fetch_html(url)
+async def fetch(url: str, params: dict = None) -> Optional[str]:
+    try:
+        async with httpx.AsyncClient(
+            timeout=TIMEOUT, follow_redirects=True,
+            headers=HEADERS, verify=False
+        ) as client:
+            r = await client.get(url, params=params)
+            if r.status_code == 200:
+                return r.text
+    except Exception as e:
+        print(f'⚠ fetch {url}: {e}')
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# GLOTR.UZ — B2B каталог поставщиков Узбекистана
+# ═══════════════════════════════════════════════════════════════
+async def scrape_glotr(query: str) -> List[Listing]:
+    html = await fetch('https://glotr.uz/search/', params={'q': query})
     if not html:
         return []
-
     tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('div[data-cy="l-card"]')[:25]:
+    results = []
+    for card in tree.css('.b-product-list__item, .product-card, [class*="product-item"]')[:20]:
         try:
-            t_node = card.css_first('h4, h6')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
+            t = card.css_first('a.title, .product-title, h3 a, .name a, a[class*="title"]')
+            title = clean_text(t.text()) if t else ''
+            if not title or len(title) < 3:
                 continue
-            p_node = card.css_first('p[data-testid="ad-price"]')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
+            p = card.css_first('[class*="price"]')
+            price = clean_price(p.text()) if p else None
             if not price or price < 100:
                 continue
             link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://www.olx.uz{href}"
-            loc_node = card.css_first('p[data-testid="location-date"]')
-            location = clean_text(loc_node.text()) if loc_node else ""
-            listings.append(Listing(
-                title=title, price=price,
-                currency=detect_currency(price_text, "UZS"),
-                address=location, url=full_url, source="olx.uz"
+            href = link.attributes.get('href', '') if link else ''
+            url = href if href.startswith('http') else f'https://glotr.uz{href}'
+            seller = card.css_first('.company-name, .seller, .b-company-info')
+            results.append(Listing(
+                title=title, price=price, currency='UZS',
+                seller_name=clean_text(seller.text()) if seller else 'glotr.uz',
+                url=url, source='glotr.uz'
             ))
         except Exception:
             continue
-    return listings
+    return results
 
 
-async def scrape_glotr_uz(query: str) -> List[Listing]:
-    """Glotr.uz — B2B-каталог Узбекистана"""
-    html = await fetch_html("https://glotr.uz/search/", params={"q": query})
+# ═══════════════════════════════════════════════════════════════
+# PROM.UZ — промышленный каталог
+# ═══════════════════════════════════════════════════════════════
+async def scrape_prom_uz(query: str) -> List[Listing]:
+    html = await fetch(f'https://prom.uz/search/?search_term={quote_plus(query)}')
     if not html:
         return []
     tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('.b-product-list__item, .product-card, [class*="product"]')[:25]:
+    results = []
+    for card in tree.css('[data-qaid="product_block"], .js-productad, [class*="product"]')[:20]:
         try:
-            t_node = card.css_first('a.title, .product-title, h3 a, .name a')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
+            t = card.css_first('[data-qaid="product_name"], a[class*="name"], h3 a')
+            title = clean_text(t.text()) if t else ''
+            if not title or len(title) < 3:
                 continue
-            p_node = card.css_first('.price, .b-product-price, [class*="price"]')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
+            p = card.css_first('[data-qaid="price"], [class*="price"]')
+            price = clean_price(p.text()) if p else None
             if not price or price < 100:
                 continue
             link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://glotr.uz{href}"
-            seller_node = card.css_first('.company, .seller, .b-company-info')
-            seller = clean_text(seller_node.text()) if seller_node else ""
-            listings.append(Listing(
-                title=title, price=price, currency="UZS",
-                seller_name=seller, url=full_url, source="glotr.uz"
+            href = link.attributes.get('href', '') if link else ''
+            url = href if href.startswith('http') else f'https://prom.uz{href}'
+            seller = card.css_first('[data-qaid="company_name"], .company-name')
+            results.append(Listing(
+                title=title, price=price, currency='UZS',
+                seller_name=clean_text(seller.text()) if seller else 'prom.uz',
+                url=url, source='prom.uz'
             ))
         except Exception:
             continue
-    return listings
+    return results
 
 
-# ════════════════════════════════════════════════════════════════════════
-# АЗЕРБАЙДЖАН
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_tap_az(query: str) -> List[Listing]:
-    """Tap.az — крупнейшая площадка Азербайджана"""
-    url = f"https://tap.az/elanlar/?keywords={quote_plus(query)}"
-    html = await fetch_html(url)
+# ═══════════════════════════════════════════════════════════════
+# OLX.UZ — с жёсткой фильтрацией по категории
+# (используем только категорию "стройматериалы")
+# ═══════════════════════════════════════════════════════════════
+async def scrape_olx_uz_category(query: str) -> List[Listing]:
+    """OLX только в категории stroymaterialy"""
+    url = f'https://www.olx.uz/stroymaterialy/q-{quote_plus(query)}/'
+    html = await fetch(url)
+    if not html:
+        # Fallback: общий поиск OLX но только бизнес-объявления
+        url = f'https://www.olx.uz/list/q-{quote_plus(query)}/?search[filter_enum_type][0]=business'
+        html = await fetch(url)
     if not html:
         return []
+
     tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('.products-i, .products-list-item, [class*="product"]')[:25]:
-        try:
-            t_node = card.css_first('.products-name, h3 a, .product-title')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
-                continue
-            p_node = card.css_first('.product-price, .price-val')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
-            if not price or price < 1:
-                continue
-            link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://tap.az{href}"
-            loc_node = card.css_first('.products-created, .location')
-            loc = clean_text(loc_node.text()) if loc_node else ""
-            listings.append(Listing(
-                title=title, price=price,
-                currency=detect_currency(price_text, "AZN"),
-                address=loc, url=full_url, source="tap.az"
-            ))
-        except Exception:
-            continue
-    return listings
-
-
-async def scrape_lalafo_az(query: str) -> List[Listing]:
-    """Lalafo.az — Азербайджан"""
-    url = f"https://lalafo.az/azerbaijan?q={quote_plus(query)}"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('article.AdItem, .ad-item, [class*="AdTile"], [class*="adItem"]')[:25]:
-        try:
-            t_node = card.css_first('h3, .ad-title, [class*="title"] a')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
-                continue
-            p_node = card.css_first('[class*="price"], .ad-price')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
-            if not price or price < 1:
-                continue
-            link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://lalafo.az{href}"
-            listings.append(Listing(
-                title=title, price=price,
-                currency=detect_currency(price_text, "AZN"),
-                url=full_url, source="lalafo.az"
-            ))
-        except Exception:
-            continue
-    return listings
-
-
-# ════════════════════════════════════════════════════════════════════════
-# КАЗАХСТАН
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_olx_kz(query: str) -> List[Listing]:
-    """OLX.kz — Казахстан"""
-    url = f"https://www.olx.kz/list/q-{quote_plus(query)}/"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    tree = HTMLParser(html)
-    listings = []
+    results = []
     for card in tree.css('div[data-cy="l-card"]')[:25]:
         try:
-            t_node = card.css_first('h4, h6')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
+            t = card.css_first('h4, h6, [data-cy="ad-card-title"]')
+            title = clean_text(t.text()) if t else ''
+            if not title or len(title) < 3:
                 continue
-            p_node = card.css_first('p[data-testid="ad-price"]')
-            price_text = p_node.text() if p_node else ""
+
+            p = card.css_first('p[data-testid="ad-price"], [data-cy="ad-price"]')
+            price_text = p.text() if p else ''
             price = clean_price(price_text)
-            if not price or price < 1:
+            if not price or price < 1000:  # минимум 1000 сум — отсекаем явный мусор
                 continue
+
             link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://www.olx.kz{href}"
-            loc_node = card.css_first('p[data-testid="location-date"]')
-            location = clean_text(loc_node.text()) if loc_node else ""
-            listings.append(Listing(
+            href = link.attributes.get('href', '') if link else ''
+            full_url = href if href.startswith('http') else f'https://www.olx.uz{href}'
+
+            loc = card.css_first('p[data-testid="location-date"]')
+            location = clean_text(loc.text()) if loc else ''
+
+            results.append(Listing(
                 title=title, price=price,
-                currency=detect_currency(price_text, "KZT"),
-                address=location, url=full_url, source="olx.kz"
+                currency='USD' if '$' in price_text else 'UZS',
+                address=location, url=full_url, source='olx.uz'
             ))
         except Exception:
             continue
-    return listings
+    return results
 
 
-async def scrape_satu_kz(query: str) -> List[Listing]:
-    """Satu.kz — B2B-маркетплейс Казахстана"""
-    url = f"https://satu.kz/search.html?search_term={quote_plus(query)}"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('[data-qaid="product_block"], .b-product-gallery__item, [class*="product"]')[:25]:
-        try:
-            t_node = card.css_first('[data-qaid="product_name"], a[class*="title"], .b-product-gallery__title')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
-                continue
-            p_node = card.css_first('[data-qaid="price"], [class*="price"]')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
-            if not price or price < 1:
-                continue
-            link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://satu.kz{href}"
-            seller_node = card.css_first('[data-qaid="company_name"], .company-name')
-            seller = clean_text(seller_node.text()) if seller_node else ""
-            listings.append(Listing(
-                title=title, price=price, currency="KZT",
-                seller_name=seller, url=full_url, source="satu.kz"
-            ))
-        except Exception:
-            continue
-    return listings
+# ═══════════════════════════════════════════════════════════════
+# UNIVERSAL WEB SEARCH — ищем по специализированным сайтам
+# ═══════════════════════════════════════════════════════════════
 
-
-# ════════════════════════════════════════════════════════════════════════
-# КЫРГЫЗСТАН
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_lalafo_kg(query: str) -> List[Listing]:
-    """Lalafo.kg — Кыргызстан"""
-    url = f"https://lalafo.kg/kyrgyzstan?q={quote_plus(query)}"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('article.AdItem, .ad-item, [class*="AdTile"], [class*="adItem"]')[:25]:
-        try:
-            t_node = card.css_first('h3, .ad-title, [class*="title"] a')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
-                continue
-            p_node = card.css_first('[class*="price"], .ad-price')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
-            if not price or price < 1:
-                continue
-            link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://lalafo.kg{href}"
-            listings.append(Listing(
-                title=title, price=price,
-                currency=detect_currency(price_text, "KGS"),
-                url=full_url, source="lalafo.kg"
-            ))
-        except Exception:
-            continue
-    return listings
-
-
-# ════════════════════════════════════════════════════════════════════════
-# РОССИЯ
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_avito_ru(query: str) -> List[Listing]:
-    """Avito.ru — Россия"""
-    url = f"https://www.avito.ru/all?q={quote_plus(query)}"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('[data-marker="item"], [class*="iva-item"]')[:25]:
-        try:
-            t_node = card.css_first('[itemprop="name"], h3 a, [data-marker="item-title"]')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
-                continue
-            p_node = card.css_first('[itemprop="price"], [data-marker="item-price"]')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
-            if not price or price < 1:
-                continue
-            link = card.css_first('a[itemprop="url"], a[data-marker="item-title"], h3 a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://www.avito.ru{href}"
-            loc_node = card.css_first('[class*="geo"], .item-address')
-            location = clean_text(loc_node.text()) if loc_node else ""
-            listings.append(Listing(
-                title=title, price=price, currency="RUB",
-                address=location, url=full_url, source="avito.ru"
-            ))
-        except Exception:
-            continue
-    return listings
-
-
-# ════════════════════════════════════════════════════════════════════════
-# ТУРЦИЯ
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_sahibinden_tr(query: str) -> List[Listing]:
-    """Sahibinden.com — крупнейшая площадка Турции"""
-    url = f"https://www.sahibinden.com/en/search?query_text_mf={quote_plus(query)}"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    tree = HTMLParser(html)
-    listings = []
-    for card in tree.css('tr.searchResultsItem, [class*="classified"]')[:25]:
-        try:
-            t_node = card.css_first('.classifiedTitle, a[class*="title"]')
-            title = clean_text(t_node.text()) if t_node else ""
-            if not title:
-                continue
-            p_node = card.css_first('.searchResultsPriceValue, [class*="price"]')
-            price_text = p_node.text() if p_node else ""
-            price = clean_price(price_text)
-            if not price or price < 1:
-                continue
-            link = card.css_first('a')
-            href = link.attributes.get("href", "") if link else ""
-            full_url = href if href.startswith("http") else f"https://www.sahibinden.com{href}"
-            listings.append(Listing(
-                title=title, price=price,
-                currency=detect_currency(price_text, "TRY"),
-                url=full_url, source="sahibinden.com"
-            ))
-        except Exception:
-            continue
-    return listings
-
-
-# ════════════════════════════════════════════════════════════════════════
-# КОНФИГУРАЦИЯ ПО СТРАНАМ
-# ════════════════════════════════════════════════════════════════════════
-COUNTRY_DEFAULT_CURRENCY = {
-    "UZ": "UZS", "AZ": "AZN", "KZ": "KZT", "KG": "KGS",
-    "TJ": "TJS", "TM": "TMT", "RU": "RUB", "TR": "TRY",
-    "CN": "CNY", "DE": "EUR", "US": "USD", "AE": "AED",
-    "GB": "GBP", "PL": "PLN", "GE": "GEL", "AM": "AMD",
+# Специализированные сайты по странам
+SUPPLIER_SITES = {
+    'UZ': [
+        'glotr.uz', 'prom.uz', 'stroyka.uz', 'pulscen.uz',
+        'uzbuilding.uz', 'tmsearch.uz', 'uztrade.uz'
+    ],
+    'AZ': ['tap.az', 'lalafo.az', 'azexport.az', 'made-in-azerbaijan.com'],
+    'KZ': ['satu.kz', 'olx.kz', 'kaspi.kz', 'pulscen.kz'],
+    'KG': ['lalafo.kg', 'sargalama.kg'],
+    'RU': ['avito.ru', 'pulscen.ru', 'tiu.ru', 'satu.kz'],
+    'TR': ['sahibinden.com', 'hepsiburada.com'],
 }
 
-SCRAPERS = {
-    "UZ": [scrape_olx_uz, scrape_glotr_uz],
-    "AZ": [scrape_tap_az, scrape_lalafo_az],
-    "KZ": [scrape_olx_kz, scrape_satu_kz],
-    "KG": [scrape_lalafo_kg],
-    "RU": [scrape_avito_ru],
-    "TR": [scrape_sahibinden_tr],
+COUNTRY_CURRENCY = {
+    'UZ': 'UZS', 'AZ': 'AZN', 'KZ': 'KZT', 'KG': 'KGS',
+    'TJ': 'TJS', 'TM': 'TMT', 'RU': 'RUB', 'TR': 'TRY',
+    'CN': 'CNY', 'DE': 'EUR', 'US': 'USD', 'AE': 'AED',
+    'GB': 'GBP', 'PL': 'PLN', 'GE': 'GEL', 'AM': 'AMD',
+}
+
+COUNTRY_HINT = {
+    'UZ': 'Узбекистан купить цена сум оптом',
+    'AZ': 'Azərbaycan qiymət almaq',
+    'KZ': 'Казахстан купить цена тенге',
+    'KG': 'Кыргызстан купить цена сом',
+    'TJ': 'Таджикистан купить цена',
+    'TM': 'Туркменистан купить цена',
+    'RU': 'Россия купить цена оптом рубль',
+    'TR': 'Türkiye satın al fiyat',
+    'CN': 'China supplier price buy',
+    'DE': 'Deutschland kaufen Preis',
+    'US': 'USA buy price supplier',
+    'AE': 'UAE Dubai buy price',
+    'GB': 'UK buy supplier price',
+    'PL': 'Polska kupić cena',
+    'GE': 'Georgia buy price supplier',
+    'AM': 'Armenia buy price supplier',
 }
 
 
-# ════════════════════════════════════════════════════════════════════════
-# DUCKDUCKGO — фолбэк для всех остальных стран
-# ════════════════════════════════════════════════════════════════════════
-async def scrape_ddg(query: str, country: str) -> List[Listing]:
-    """Универсальный фолбэк через DuckDuckGo"""
-    country_hints = {
-        "UZ": "Узбекистан Ташкент купить",
-        "AZ": "Azerbaycan Baku купить",
-        "KZ": "Казахстан Алматы купить",
-        "KG": "Кыргызстан Бишкек купить",
-        "TJ": "Таджикистан Душанбе купить",
-        "TM": "Туркменистан Ашхабад купить",
-        "RU": "Россия купить цена",
-        "TR": "Türkiye satın al",
-        "CN": "China supplier price",
-        "DE": "Deutschland kaufen Preis",
-        "US": "USA buy price supplier",
-        "AE": "UAE Dubai supplier price",
-        "GB": "UK supplier price",
-        "PL": "Polska kupić cena",
-        "GE": "Georgia Tbilisi supplier",
-        "AM": "Armenia Yerevan supplier",
-    }
-    full_query = f"{query} {country_hints.get(country, '')}"
-    html = await fetch_html("https://html.duckduckgo.com/html", params={"q": full_query})
+async def search_web(query: str, country: str, region: str) -> List[Listing]:
+    """
+    Поиск через DuckDuckGo с фокусом на специализированных поставщиков.
+    Ищет по конкретным сайтам-поставщикам.
+    """
+    sites = SUPPLIER_SITES.get(country, [])
+    default_cur = COUNTRY_CURRENCY.get(country, 'USD')
+    hint = COUNTRY_HINT.get(country, '')
+    region_hint = region if region else ''
+
+    results = []
+
+    # Запрос 1: поиск по специализированным сайтам
+    if sites:
+        site_filter = ' OR '.join(f'site:{s}' for s in sites[:4])
+        full_query = f'{query} {region_hint} ({site_filter})'
+        r = await _ddg_search(full_query, default_cur)
+        results.extend(r)
+
+    # Запрос 2: общий поиск с контекстом страны
+    if len(results) < 3:
+        full_query = f'{query} поставщик {region_hint} {hint} цена'
+        r = await _ddg_search(full_query, default_cur)
+        results.extend(r)
+
+    return results
+
+
+async def _ddg_search(query: str, default_cur: str) -> List[Listing]:
+    """Внутренний поиск через DuckDuckGo HTML"""
+    html = await fetch('https://html.duckduckgo.com/html', params={'q': query})
     if not html:
         return []
 
     tree = HTMLParser(html)
-    listings = []
-    default_currency = COUNTRY_DEFAULT_CURRENCY.get(country, "USD")
+    results = []
 
-    for r in tree.css('.result__body')[:20]:
+    for r in tree.css('.result__body')[:15]:
         try:
-            t_node = r.css_first('.result__title a')
-            title = clean_text(t_node.text()) if t_node else ""
-            href = t_node.attributes.get("href", "") if t_node else ""
-
-            sn_node = r.css_first('.result__snippet')
-            snippet = clean_text(sn_node.text()) if sn_node else ""
-
+            t = r.css_first('.result__title a')
+            if not t:
+                continue
+            title = clean_text(t.text())
+            href = t.attributes.get('href', '')
             if not title or not href:
                 continue
 
-            price = None
-            for token in snippet.split():
-                p = clean_price(token)
-                # Минимальная цена зависит от валюты (UZS/RUB/KZT в десятках тысяч обычно)
-                min_price = 100 if default_currency in ("UZS", "RUB", "KZT") else 1
-                if p and min_price <= p < 1_000_000_000:
-                    price = p
-                    break
+            sn = r.css_first('.result__snippet')
+            snippet = clean_text(sn.text()) if sn else ''
+
+            # Ищем цену в сниппете
+            price = _extract_price(snippet, default_cur)
             if not price:
                 continue
 
             domain = extract_domain(href)
-            listings.append(Listing(
+            results.append(Listing(
                 title=title, price=price,
-                currency=detect_currency(snippet, default_currency),
-                seller_name=domain, address=snippet[:150],
-                url=href, source=f"web ({domain})"
+                currency=_detect_currency(snippet, default_cur),
+                seller_name=domain,
+                address=snippet[:150],
+                url=href,
+                source=f'web ({domain})'
             ))
         except Exception:
             continue
 
-    return listings
+    return results
 
 
-# ════════════════════════════════════════════════════════════════════════
+def _extract_price(text: str, currency: str) -> Optional[float]:
+    """Извлекает цену из текста, учитывая масштаб валюты"""
+    # Паттерны цен: 45 000, 45.000, 45,000 и т.д.
+    patterns = [
+        r'(\d[\d\s]{1,12}\d)\s*(?:сум|sum|uzs|so\'m)',
+        r'(\d[\d\s]{1,12}\d)\s*(?:тенге|kzt|₸)',
+        r'(\d[\d\s]{1,12}\d)\s*(?:руб|rub|₽)',
+        r'(\d[\d\s]{1,12}\d)\s*(?:azn|ман|manat|₼)',
+        r'(\d+[.,]\d+)\s*(?:\$|usd)',
+        r'(\d[\d\s]{2,12}\d)',  # любое многозначное число
+    ]
+
+    min_price = {
+        'UZS': 5000, 'KZT': 100, 'RUB': 10,
+        'AZN': 1, 'USD': 1, 'EUR': 1,
+    }.get(currency, 1)
+
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            raw = re.sub(r'\s', '', m.group(1))
+            price = clean_price(raw)
+            if price and price >= min_price:
+                return price
+    return None
+
+
+def _detect_currency(text: str, default: str) -> str:
+    text_up = text.upper()
+    if '$' in text or 'USD' in text_up: return 'USD'
+    if '€' in text or 'EUR' in text_up: return 'EUR'
+    if '₽' in text or 'RUB' in text_up or 'РУБ' in text_up: return 'RUB'
+    if '₸' in text or 'KZT' in text_up or 'ТЕНГЕ' in text_up: return 'KZT'
+    if '₼' in text or 'AZN' in text_up or 'МАНАТ' in text_up: return 'AZN'
+    if 'СУМ' in text_up or 'UZS' in text_up or "SO'M" in text_up: return 'UZS'
+    return default
+
+
+# ═══════════════════════════════════════════════════════════════
 # ОРКЕСТРАТОР
-# ════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 async def search_all_sources(
-    query: str, country: str = "UZ", region: str = ""
+    query: str, country: str = 'UZ', region: str = ''
 ) -> List[Listing]:
     """
-    Запускает все доступные скраперы для страны параллельно.
-    Если основные дали мало результатов — добавляет фолбэк через DuckDuckGo.
+    Запускает поиск по всем источникам параллельно.
+    Для Узбекистана: Glotr + Prom.uz + OLX (категория) + веб-поиск
+    Для других стран: веб-поиск по специализированным сайтам
     """
-    funcs = SCRAPERS.get(country, [])
-    tasks = [f(query) for f in funcs]
-    results: List[Listing] = []
+    tasks = []
 
-    if tasks:
-        scraped = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in scraped:
-            if isinstance(r, list):
-                results.extend(r)
-            elif isinstance(r, Exception):
-                print(f"⚠ Scraper failed: {r}")
+    if country == 'UZ':
+        tasks = [
+            scrape_glotr(query),
+            scrape_prom_uz(query),
+            scrape_olx_uz_category(query),
+            search_web(query, country, region),
+        ]
+    elif country in ('AZ', 'KZ', 'KG', 'RU', 'TR'):
+        tasks = [
+            search_web(query, country, region),
+        ]
+    else:
+        tasks = [
+            search_web(query, country, region),
+        ]
 
-    # Фолбэк через DuckDuckGo если основных мало
-    if len(results) < 3:
-        try:
-            ddg_results = await scrape_ddg(query, country)
-            results.extend(ddg_results)
-        except Exception as e:
-            print(f"⚠ DDG fallback failed: {e}")
+    all_results: List[Listing] = []
+    scraped = await asyncio.gather(*tasks, return_exceptions=True)
+    for r in scraped:
+        if isinstance(r, list):
+            all_results.extend(r)
+        elif isinstance(r, Exception):
+            print(f'⚠ Source failed: {r}')
 
-    return results
+    return all_results
