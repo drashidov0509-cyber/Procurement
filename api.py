@@ -6,7 +6,7 @@ import os
 import sys
 import json
 import asyncio
-import threading
+import webview
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -72,8 +72,8 @@ class API:
                         search_all_sources(query, country=country, region=region)
                     )
 
-                    # Классифицируем — cheap/mid/exp
-                    suppliers = classify_suppliers(listings, item.get("qty", 1))
+                    # Классифицируем — передаём query для фильтрации мусора
+                    suppliers = classify_suppliers(listings, item.get("qty", 1), query=query)
 
                     rows.append({
                         "item_num": idx,
@@ -130,13 +130,13 @@ class API:
                 # Открыть диалог сохранения
                 if self._window:
                     files = self._window.create_file_dialog(
-                        webview_dialog_type=2,  # SAVE_DIALOG
+                        dialog_type=webview.SAVE_DIALOG,
                         save_filename=f"procurement_{country_name}_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                        file_types=("Excel (*.xlsx)",),
+                        file_types=("Excel files (*.xlsx)",),
                     )
                     if not files:
                         return {"cancelled": True}
-                    save_path = files if isinstance(files, str) else files[0]
+                    save_path = files[0] if isinstance(files, (list, tuple)) else files
 
             export_to_excel(result, country_name, save_path)
             return {"ok": True, "path": save_path}
@@ -153,14 +153,14 @@ class API:
                 return {"error": "Окно недоступно"}
 
             files = self._window.create_file_dialog(
-                webview_dialog_type=0,  # OPEN_DIALOG
+                dialog_type=webview.OPEN_DIALOG,
                 allow_multiple=False,
-                file_types=("Excel (*.xlsx;*.xls)",),
+                file_types=("Excel files (*.xlsx;*.xls)",),
             )
             if not files:
                 return {"cancelled": True}
 
-            file_path = files if isinstance(files, str) else files[0]
+            file_path = files[0] if isinstance(files, (list, tuple)) else files
 
             from openpyxl import load_workbook
             wb = load_workbook(file_path, read_only=True, data_only=True)
